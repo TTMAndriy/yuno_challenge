@@ -1,0 +1,49 @@
+{
+  "routing_strategy": "cost_aware",
+  "health": {
+    "window_seconds": 60,
+    "min_samples": 20,
+    "technical_success_threshold": 0.6,
+    "auth_rate_floor": 0.3,
+    "open_cooldown_seconds": 30,
+    "probe_requests": 2
+  },
+  "admission": {
+    "queue_timeout_ms": 2500,
+    "priority_queue_timeout_ms": 5000,
+    "max_queue_depth": 450,
+    "max_priority_queue_depth": 150,
+    "poll_interval_ms": 10
+  },
+  "upstream": {
+    "connect_timeout_s": 1.0,
+    "read_timeout_s": 2.0,
+    "max_attempts": 2,
+    "rate_limit_headroom": 0.85,
+    "inflight_ratio": 0.25
+  },
+  "processors": [
+    {
+      "id": "psp-atlas",
+      "name": "Atlas Pay",
+      "base_url": "http://127.0.0.1:9001",
+      "max_rps": 150,
+      "fee_percent": 2.5,
+      "baseline": true
+    },
+    {
+      "id": "psp-borealis",
+      "name": "Borealis Payments",
+      "base_url": "http://127.0.0.1:9002",
+      "max_rps": 100,
+      "fee_percent": 2.9
+    },
+    {
+      "id": "psp-cygnus",
+      "name": "Cygnus Financial",
+      "base_url": "http://127.0.0.1:9003",
+      "max_rps": 200,
+      "fee_percent": 2.1
+    }
+  ]
+}
