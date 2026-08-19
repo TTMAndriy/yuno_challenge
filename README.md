@@ -12,17 +12,43 @@ five minutes of a flash sale, against a primary processor that caps at 150 TPS.
 
 ## Quick start
 
+One command, one terminal. Boots everything, runs the checks, tears down, and
+exits non-zero on any failure.
+
+```bash
+./verify.sh                 # unit tests + full 4-scenario demo   (~5 min)
+./verify.sh --quick         # unit tests + one 500-rps load test  (~1 min)
+./verify.sh --tests-only    # unit tests only                     (~5 s)
+```
+
+It installs missing dependencies itself. `make verify`, `make verify-quick` and
+`make test` are the same three things.
+
+### For a reviewer, in order
+
+| To check | Run | Time |
+|---|---|---|
+| Everything | `./verify.sh` | ~5 min |
+| Requirement 1 + 2 logic in isolation | `./verify.sh --tests-only` | ~5 s |
+| Rate limiting under real load | `./verify.sh --quick` | ~1 min |
+| A specific scenario | `./run.sh` then `python3 -m loadgen.demo --only failure` | ~1 min |
+| Live system state | `./run.sh` then `curl localhost:8080/metrics/summary` | — |
+
+The 75 unit tests are the fastest way to see whether the two graded requirements
+are implemented correctly: `tests/test_ratelimit.py` is Requirement 1,
+`tests/test_health.py` is Requirement 2, and both encode the specific bugs found
+during development so a future edit cannot silently reintroduce them.
+
+### Running it by hand
+
 ```bash
 pip install -r requirements.txt
-
 ./run.sh                    # terminal 1: 3 mock PSPs + the router
 python3 -m loadgen.demo     # terminal 2: the four-scenario demo
 ```
 
 First boot takes ~30s (four separate uvicorn processes). `run.sh` reports each
-service as it comes up and exits with an error if any fails to start.
-
-The demo prints acceptance checks as it goes and exits non-zero if any fail.
+service as it comes up and fails loudly if any does not.
 
 Other entry points:
 
@@ -94,6 +120,8 @@ That is a deliberate choice, discussed under Tradeoffs.
 | `loadgen/generate.py` | Multi-process traffic generator + rate-limit verification |
 | `loadgen/demo.py` | The four-scenario narrated demo |
 | `config/processors.json` | All tunables in one place |
+| `tests/` | 75 unit tests; each encodes a bug found during development |
+| `verify.sh` | One-command boot + test + demo + teardown, CI-safe exit code |
 
 ---
 

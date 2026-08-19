@@ -111,12 +111,22 @@ class SlidingWindowLimiter:
         headroom: float = 0.95,
         inflight_ratio: float = 0.30,
     ) -> None:
-        if max_rps <= 0:
-            raise ValueError("max_rps must be positive")
+        # Below 2 rps the invariant is unsatisfiable: the rate window and the
+        # in-flight bound each need at least one slot, and their sum cannot then
+        # fit inside max_rps. Refusing is better than shipping a limiter whose
+        # guarantee quietly does not hold. Found by the parametrised invariant
+        # test, not by inspection.
+        if max_rps < 2:
+            raise ValueError(
+                f"max_rps must be at least 2 to protect a processor "
+                f"(rate ceiling and in-flight bound each need one slot); got {max_rps}"
+            )
         self.max_rps = max_rps
         self.headroom = headroom
         # Never round down to zero for very small limits.
-        self.effective_limit = max(1, int(max_rps * headroom))
+        # Clamped to max_rps - 1 so at least one slot always remains for the
+        # in-flight budget, even at headroom=1.0.
+        self.effective_limit = max(1, min(int(max_rps * headroom), max_rps - 1))
         # Derived, not configured: the requested ratio is honoured only while the
         # invariant holds. `max_rps - effective_limit` is the entire budget left
         # for a worst-case in-flight batch, so the bound can never exceed it.
