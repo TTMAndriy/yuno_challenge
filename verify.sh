@@ -97,7 +97,7 @@ grep "router ready" logs/router.log | sed 's/.*| /    /'
 # ----------------------------------------------------------------- the demo
 if [ "$MODE" = "--quick" ]; then
   step "QUICK LOAD TEST -- 500 rps for 8s"
-  python3 -m loadgen.generate --rps 500 --seconds 8 --workers 6 --reset 2>&1 | tail -32
+  python3 -m loadgen.generate --rps 500 --seconds 8 --reset 2>&1 | tail -32
   if python3 - <<'PY'
 import asyncio, sys, httpx
 async def main():
@@ -115,7 +115,7 @@ else
   step "END-TO-END DEMO -- 4 scenarios (~4 min)"
   echo "  1. normal traffic   2. the midnight spike"
   echo "  3. processor failure mid-sale   4. automatic recovery"
-  if python3 -m loadgen.demo --workers 6; then
+  if python3 -m loadgen.demo; then
     echo "  DEMO: PASS"
   else
     echo "  DEMO: FAIL"

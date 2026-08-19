@@ -36,6 +36,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 import httpx
+import os
 from concurrent.futures import ProcessPoolExecutor
 
 ROUTER = "http://127.0.0.1:8080"
@@ -53,6 +54,21 @@ CLIENT_LIMITS = {"max_connections": 64, "max_keepalive_connections": 64}
 # A shopper abandons checkout long before 15s. 8s is already generous and makes
 # the generator's own timeouts visible instead of hiding them behind patience.
 CLIENT_TIMEOUT_S = 8.0
+
+
+def default_workers() -> int:
+    """Leave cores for the service under test.
+
+    The stack is four CPU-hungry processes (three mock PSPs plus the router). On
+    an eight-core machine, six generator workers means ten processes on eight
+    cores, the generator starves the service, and the latency it reports is
+    scheduler contention rather than anything the router did: p95 inflated from
+    34ms to ~670ms and the in-flight bound looked like a throughput bug.
+
+    So the default reserves the four service cores plus one, and never drops
+    below two workers since one process caps near 150 rps.
+    """
+    return max(2, (os.cpu_count() or 8) - 5)
 PSPS = {
     "psp-atlas": "http://127.0.0.1:9001",
     "psp-borealis": "http://127.0.0.1:9002",
@@ -399,8 +415,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seconds", type=float, default=10, help="duration for --rps")
     p.add_argument("--concurrent", type=int, help="fire N unpaced simultaneous requests")
     p.add_argument(
-        "--workers", type=int, default=4,
-        help="OS processes generating load. One process caps near 150 rps.",
+        "--workers", type=int, default=default_workers(),
+        help=(
+            "OS processes generating load. One process caps near 150 rps, but "
+            "too many starve the service under test and the latency you measure "
+            "becomes scheduler contention. Default leaves cores for the stack."
+        ),
     )
     p.add_argument("--no-monitor", action="store_true", help="suppress the live router table")
     p.add_argument("--reset", action="store_true", help="reset router + PSP counters first")

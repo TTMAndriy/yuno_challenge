@@ -17,6 +17,7 @@ import sys
 import httpx
 
 from .generate import (
+    default_workers,
     PSPS,
     ROUTER,
     Stage,
@@ -261,7 +262,7 @@ async def print_final_state() -> None:
 
 async def main() -> None:
     ap = argparse.ArgumentParser(description="Four-scenario demo")
-    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--workers", type=int, default=default_workers())
     ap.add_argument(
         "--only",
         choices=["normal", "midnight", "failure", "recovery"],

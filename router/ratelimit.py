@@ -99,10 +99,42 @@ class SlidingWindowLimiter:
         15% headroom + unconstrained bound   Cygnus saw 210 / 200  29 rejections
         25% headroom + derived bound         invariant holds by construction
 
-    The cost is real: reserving both ceilings inside max_rps leaves advertised
-    capacity unused (450 rps configured, ~337 rps usable). An adaptive bound
-    driven by observed latency would recover most of that and is the change I
-    would make next.
+    Sizing the pair -- and why the obvious choice was wrong
+    ------------------------------------------------------
+    Satisfying the invariant is necessary but not sufficient: the in-flight bound
+    also caps *throughput*, by Little's Law, at `max_inflight / latency`. Sized
+    too tight it becomes the binding constraint and simply wastes the rate
+    ceiling.
+
+    The rule is:
+
+        throughput = min(effective_limit, max_inflight / latency)
+
+    so the bound must satisfy `max_inflight >= effective_limit * latency` or it
+    caps throughput below the rate ceiling it was meant to complement.
+
+    ⚠ This nearly led me to the wrong conclusion, and the story is worth keeping.
+    Under a 400 rps load test Atlas sat pinned at 19/19 in-flight while using only
+    67 of its 127 rps, with in-flight rejections outnumbering rate rejections
+    20,439 to 833. That implies a 280ms round trip, and I was about to re-size the
+    bound for it.
+
+    The 280ms was not real. The load generator was running six worker processes
+    against three mock PSPs and the router on an eight-core machine -- ten
+    CPU-hungry Python processes on eight cores. The generator was starving the
+    service under test, and the "latency" being measured was scheduler contention.
+    Re-run with two workers: p95 latency 34ms, peak in-flight 8 of 40, and **zero**
+    in-flight rejections. The bound never binds at real latency.
+
+    At 34ms observed (100ms used as the reference, for margin), a bound of 19
+    supports 190 rps against a 127 rps rate ceiling -- comfortable. Headroom stays
+    at 0.85, which yields 382 rps usable and has a measured record of zero
+    rate-limit breaches across all four scenarios.
+
+    The lesson generalises past this project: a load generator sharing a machine
+    with the service under test will, past some concurrency, measure itself.
+    `tests/test_config.py` asserts the throughput relationship so a future
+    re-sizing cannot quietly reintroduce a throttle.
     """
 
     def __init__(
