@@ -61,13 +61,21 @@ class Processor:
             open_cooldown_seconds=app_cfg.health.open_cooldown_seconds,
             probe_requests=app_cfg.health.probe_requests,
         )
-        # Accounting for the cost-savings report (Stretch Goal A).
+        # Accounting for the cost-savings report (Stretch Goal A). Split by lane
+        # because the two lanes optimise for different things and blending them
+        # makes the report unreadable -- see ProcessorPool.cost_report.
         self.approved_amount_cents = 0
         self.fees_paid_cents = 0
+        self.priority_amount_cents = 0
+        self.priority_fees_cents = 0
 
-    def record_approval_economics(self, amount_cents: int) -> None:
+    def record_approval_economics(self, amount_cents: int, priority: bool = False) -> None:
+        fee = round(amount_cents * self.fee_percent / 100)
         self.approved_amount_cents += amount_cents
-        self.fees_paid_cents += round(amount_cents * self.fee_percent / 100)
+        self.fees_paid_cents += fee
+        if priority:
+            self.priority_amount_cents += amount_cents
+            self.priority_fees_cents += fee
 
     def snapshot(self) -> dict:
         return {
@@ -151,19 +159,52 @@ class ProcessorPool:
         return changes
 
     def cost_report(self) -> dict:
-        """Stretch Goal A: savings versus routing everything to the baseline."""
-        volume = sum(p.approved_amount_cents for p in self.processors)
-        actual = sum(p.fees_paid_cents for p in self.processors)
-        baseline = round(volume * self.baseline_fee_percent / 100)
-        blended = (actual / volume * 100) if volume else None
+        """Stretch Goal A: savings versus routing everything to the baseline.
+
+        Reported per lane, because a single blended number was actively
+        misleading. Priority traffic is routed by reliability, not fee, and
+        priority traffic is by definition the high-value baskets -- so it lands
+        disproportionately on the *expensive* reliable processors and carries
+        disproportionate volume. Blending the lanes produced a headline of
+        "saved -1,581 MXN", i.e. cost optimisation appearing to lose money when
+        it was in fact working and being deliberately overridden for the orders
+        that matter most.
+
+        Splitting them shows both truths: normal traffic saves money, and
+        priority routing knowingly pays a premium to protect large orders.
+        """
+        total_volume = sum(p.approved_amount_cents for p in self.processors)
+        total_fees = sum(p.fees_paid_cents for p in self.processors)
+        prio_volume = sum(p.priority_amount_cents for p in self.processors)
+        prio_fees = sum(p.priority_fees_cents for p in self.processors)
+        norm_volume = total_volume - prio_volume
+        norm_fees = total_fees - prio_fees
+
+        def lane(volume: int, fees: int) -> dict:
+            baseline = round(volume * self.baseline_fee_percent / 100)
+            return {
+                "approved_volume_cents": volume,
+                "fees_paid_cents": fees,
+                "fees_if_all_baseline_cents": baseline,
+                "savings_cents": baseline - fees,
+                "savings_pct_of_fees": (
+                    round((baseline - fees) / baseline * 100, 2) if baseline else None
+                ),
+                "blended_effective_fee_percent": (
+                    round(fees / volume * 100, 4) if volume else None
+                ),
+            }
+
         return {
             "baseline_processor_fee_percent": self.baseline_fee_percent,
-            "approved_volume_cents": volume,
-            "fees_paid_cents": actual,
-            "fees_if_all_baseline_cents": baseline,
-            "savings_cents": baseline - actual,
-            "savings_pct_of_fees": round((baseline - actual) / baseline * 100, 2) if baseline else None,
-            "blended_effective_fee_percent": round(blended, 4) if blended is not None else None,
+            "note": (
+                "Normal-lane savings is the Stretch Goal A number. The priority "
+                "lane routes by reliability rather than fee, so a premium there "
+                "is the intended tradeoff, not a regression."
+            ),
+            "normal_lane": lane(norm_volume, norm_fees),
+            "priority_lane": lane(prio_volume, prio_fees),
+            "combined": lane(total_volume, total_fees),
         }
 
     def snapshot(self) -> list[dict]:

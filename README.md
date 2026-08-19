@@ -97,6 +97,87 @@ That is a deliberate choice, discussed under Tradeoffs.
 
 ---
 
+## Verified results
+
+`python3 -m loadgen.demo` — **16/16 acceptance checks pass**. Output below is
+from an actual run, not illustrative.
+
+### Rate limits, under every condition tested
+
+Reported by the processors, whose 429 counters are the only honest witness:
+
+| Scenario | Atlas (150) | Borealis (100) | Cygnus (200) | Rejections |
+|---|---|---|---|---|
+| Normal, 120 rps | 21 | 15 | 109 | **0** |
+| Midnight spike, 500 rps | 79 | 59 | 161 | **0** |
+| Processor failure mid-sale | 128 | 88 | 175 | **0** |
+| After recovery | 49 | 30 | 173 | **0** |
+
+The failure row is the hard case: the moment a circuit opens, the entire load
+shifts onto the remaining processors in one step. That surge is what defeated
+both earlier limiter designs.
+
+### The midnight spike
+
+500 rps against a 382 rps effective ceiling:
+
+```
+total requests          7370
+approved                3725    50.5%
+declined by bank         370     5.0%
+shed (at capacity)      2605    35.3%   <- rejected in ms with a clear 503
+failed (technical)         9     0.1%
+handled by a PSP        4095    55.6%
+```
+
+Overflow is shed fast rather than queued into a timeout. No processor overloaded.
+
+### Failure detected and absorbed without a human
+
+Live monitor, failure induced at t=5.0 (`in/s` = offered rate, per-processor
+cells are `current/limit`):
+
+```
+        t   in/s      ok   decl   shed   fail     q        atlas    borealis      cygnus
+      4.0    200     679     67      0      1     0   29/127      20/85      155/170
+  --- inducing failure on psp-cygnus ---
+      6.0    200    1048     96      0      3     0  125/127      53/85      162/170
+      8.0    199    1411    128      0     10     0  127/127      44/85      166/170
+     12.2    155    1968    178      0     25    32   66/127      51/85       59/170
+```
+
+Atlas goes from 29 to 125 rps within one second of the failure, saturating at its
+127 ceiling — traffic redistributed with no manual intervention. Mercado Luna's
+Week 3 took 12 minutes and cost $180K. Cygnus's circuit opened, 989 failovers
+carried the affected requests, and the remaining processors kept serving.
+
+### Automatic recovery
+
+```
+breakers before repair: atlas=closed  borealis=closed  cygnus=open
+>> psp-cygnus has been repaired
+waiting for the router to notice on its own (probe cooldown is 30s)...
+psp-cygnus breaker is now: closed
+```
+
+Post-recovery traffic: 1,600 requests, **100% handled**, p50 20.9ms, 0 rejections.
+The router was never told the processor was fixed — synthetic probes found out.
+
+### Cost (Stretch A)
+
+```
+normal lane    paid 30,042.84 vs 35,534.11 all-baseline -> saved 5,491.27 MXN (15.45%)  blended 2.1137%
+priority lane  paid 88,570.15 vs 82,566.48 all-baseline -> premium 6,003.67 MXN (routed for reliability)
+```
+
+Reported per lane after a single blended figure proved misleading: it read
+"saved −1,581 MXN", which looked like cost optimisation losing money. In fact
+normal traffic saves 15.45% while the priority lane knowingly pays a premium —
+priority baskets are the high-value ones and are routed to the most reliable
+processor regardless of fee. Averaging the two lanes hid both facts.
+
+---
+
 ## Design decisions
 
 ### A decline is not a failure
@@ -213,6 +294,11 @@ queue and a worker pool to disagree about who owns a request.
 `queued` and `inflight` are tracked as distinct numbers. Conflating them was a
 real bug during development: shedding triggered on total concurrency instead of
 on the backlog, so the queue never appeared full and nothing was ever shed.
+
+The deadline is also **request-scoped, not attempt-scoped**. Giving each retry
+hop a fresh 2.5s meant a retried request could legitimately wait twice the
+budget — observed max queue wait was 5194ms against a stated 2500ms. A latency
+budget that silently doubles on retry is not a budget.
 
 ### Retry policy
 

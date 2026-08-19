@@ -92,13 +92,17 @@ async def metrics_summary() -> str:
             f"{str(p['fee_percent']) + '%':>7}{h['lifetime']['requests']:>9}"
         )
     c = m["cost"]
+    n, pr = c["normal_lane"], c["priority_lane"]
     lines += [
         "",
-        f"cost: paid {c['fees_paid_cents'] / 100:,.2f} MXN vs "
-        f"{c['fees_if_all_baseline_cents'] / 100:,.2f} MXN all-baseline "
-        f"-> saved {c['savings_cents'] / 100:,.2f} MXN "
-        f"({c['savings_pct_of_fees']}% of fees), blended fee "
-        f"{c['blended_effective_fee_percent']}%",
+        f"cost  normal lane   paid {n['fees_paid_cents'] / 100:>12,.2f} vs "
+        f"{n['fees_if_all_baseline_cents'] / 100:>12,.2f} all-baseline"
+        f"  -> saved {n['savings_cents'] / 100:>10,.2f} MXN "
+        f"({n['savings_pct_of_fees']}%)  blended {n['blended_effective_fee_percent']}%",
+        f"      priority lane paid {pr['fees_paid_cents'] / 100:>12,.2f} vs "
+        f"{pr['fees_if_all_baseline_cents'] / 100:>12,.2f} all-baseline"
+        f"  -> premium {-(pr['savings_cents'] or 0) / 100:>8,.2f} MXN "
+        f"(routed for reliability, not fee)",
     ]
     return "\n".join(lines)
 
@@ -130,5 +134,7 @@ async def reset_metrics() -> dict:
     for p in service.pool.processors:
         p.approved_amount_cents = 0
         p.fees_paid_cents = 0
+        p.priority_amount_cents = 0
+        p.priority_fees_cents = 0
     log.info("metrics counters reset (breaker state and health windows preserved)")
     return {"reset": True}

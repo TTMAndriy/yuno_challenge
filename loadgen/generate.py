@@ -490,7 +490,7 @@ async def live_monitor(stop: asyncio.Event, interval: float = 1.0) -> None:
                     f"{t['approved']:>7} {t['declined']:>6} "
                     f"{t['rejected_system_at_capacity']:>6} "
                     f"{t['failed_technical'] + t['rejected_no_healthy_processor']:>6} "
-                    f"{q['normal_waiting'] + q['priority_waiting']:>5}  "
+                    f"{q['normal_queued'] + q['priority_queued']:>5}  "
                     + " ".join(f"{c:>11}" for c in cells)
                 )
             except Exception as exc:

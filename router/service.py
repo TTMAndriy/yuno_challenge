@@ -197,12 +197,19 @@ class LoadDistributionService:
         attempts: list[AttemptRecord] = []
         tried: set[str] = set()
         queued_ms = 0.0
+        # ONE deadline for the whole request, shared across retry hops.
+        #
+        # Giving each attempt its own fresh timeout meant a retried request could
+        # legitimately wait 2 x queue_timeout: observed max queue wait was 5194ms
+        # against a stated 2500ms budget. A latency budget that silently doubles
+        # on retry is not a budget.
+        request_deadline = time.monotonic() + timeout_s
 
         self._inflight[lane] += 1
         try:
             for attempt_no in range(1, self.cfg.upstream.max_attempts + 1):
                 processor, waited_ms = await self._acquire_processor(
-                    tried, req.priority, timeout_s, lane
+                    tried, req.priority, request_deadline, lane
                 )
                 queued_ms += waited_ms
 
@@ -277,7 +284,7 @@ class LoadDistributionService:
                     )
 
                 if result.outcome is Outcome.APPROVED:
-                    processor.record_approval_economics(req.amount_cents)
+                    processor.record_approval_economics(req.amount_cents, req.priority)
                     self.counters.approved += 1
                     total_ms = (time.perf_counter() - started) * 1000
                     self.counters.latency_samples.append(total_ms)
@@ -344,7 +351,7 @@ class LoadDistributionService:
         )
 
     async def _acquire_processor(
-        self, tried: set[str], priority: bool, timeout_s: float, lane: str
+        self, tried: set[str], priority: bool, deadline: float, lane: str
     ) -> tuple[Processor | None, float]:
         """Select a processor, waiting briefly for capacity if necessary.
 
@@ -355,7 +362,6 @@ class LoadDistributionService:
         no risk of a worker pool and a queue disagreeing about who owns a request.
         """
         poll_s = self.cfg.admission.poll_interval_ms / 1000.0
-        deadline = time.monotonic() + timeout_s
         waited_start = time.perf_counter()
 
         processor = self.pool.select(exclude=tried, priority=priority)
