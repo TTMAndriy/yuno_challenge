@@ -34,7 +34,7 @@ It installs missing dependencies itself. `make verify`, `make verify-quick` and
 | A specific scenario | `./run.sh` then `python3 -m loadgen.demo --only failure` | ~1 min |
 | Live system state | `./run.sh` then `curl localhost:8080/metrics/summary` | — |
 
-The 90 unit tests are the fastest way to see whether the two graded requirements
+The 92 unit tests are the fastest way to see whether the two graded requirements
 are implemented correctly: `tests/test_ratelimit.py` is Requirement 1,
 `tests/test_health.py` is Requirement 2, `tests/test_service.py` covers admission
 control, failover and capacity release — and all of them encode the specific bugs
@@ -121,7 +121,7 @@ That is a deliberate choice, discussed under Tradeoffs.
 | `loadgen/generate.py` | Multi-process traffic generator + rate-limit verification |
 | `loadgen/demo.py` | The four-scenario narrated demo |
 | `config/processors.json` | All tunables in one place |
-| `tests/` | 90 unit tests; each encodes a bug found during development |
+| `tests/` | 92 unit tests; each encodes a bug found during development |
 | `verify.sh` | One-command boot + test + demo + teardown, CI-safe exit code |
 
 ---
@@ -137,10 +137,10 @@ Reported by the processors, whose 429 counters are the only honest witness:
 
 | Scenario | Atlas (150) | Borealis (100) | Cygnus (200) | Rejections |
 |---|---|---|---|---|
-| Normal, 120 rps | 22 | 15 | 110 | **0** |
-| Midnight spike, 500 rps | 113 | 69 | 193 | **0** |
-| Processor failure mid-sale | 143 | 88 | 181 | **0** |
-| After recovery | 81 | 57 | 160 | **0** |
+| Normal, 120 rps | 20 | 13 | 111 | **0** |
+| Midnight spike, 500 rps | 92 | 63 | 169 | **0** |
+| Processor failure mid-sale | 128 | 64 | 174 | **0** |
+| After recovery | 32 | 21 | 172 | **0** |
 
 The failure row is the hard case: when a circuit opens, the whole load shifts
 onto the survivors in one step. That surge defeated three earlier limiter
@@ -150,10 +150,10 @@ designs before the invariant made it structural.
 
 | Scenario | p50 | p95 | p99 |
 |---|---|---|---|
-| Normal, 120 rps | 21ms | 36ms | 67ms |
-| Midnight spike, 500 rps | 23ms | 2537ms | 3067ms |
-| Processor failure mid-sale | 28ms | 144ms | 342ms |
-| After recovery | 194ms | 2633ms | 5021ms |
+| Normal, 120 rps | 22ms | 33ms | 48ms |
+| Midnight spike, 500 rps | 588ms | 2580ms | 3334ms |
+| Processor failure mid-sale | 812ms | 3425ms | 5076ms |
+| After recovery | 21ms | 33ms | 42ms |
 
 The failure scenario at p50 28ms is the number I care about most: the busiest
 processor died and the median checkout was unaffected.
@@ -202,8 +202,8 @@ processor regardless of fee. Averaging the lanes hid both facts.
 
 | Lane | Budget | Max observed | Over budget |
 |---|---|---|---|
-| normal | 2500ms | 2638ms | 26.5% of queued requests, by ≤138ms |
-| priority | 5000ms | 5044ms | 0.4% of queued requests, by ≤44ms |
+| normal | 2500ms | 2770ms | 22.4% of queued requests, by ≤270ms |
+| priority | 5000ms | 5078ms | 0.8% of queued requests, by ≤78ms |
 
 This started far worse and took three rounds to fix, which is worth recording
 because the first two rounds were the wrong fix.
@@ -213,7 +213,7 @@ because the first two rounds were the wrong fix.
 | per-attempt deadline (each retry got a fresh 2500ms) | 5194ms | — |
 | request-scoped deadline | 3316ms | 89.4% |
 | + clamped sleep, queue cut 450 → 150 | 3005ms | 86.6% |
-| **+ event-driven handoff (final)** | **2638ms** | **26.5%** |
+| **+ event-driven handoff (final)** | **2770ms** | **22.4%** |
 
 The cause was not the deadline arithmetic. It was the polling loop: 450 queued
 coroutines waking every 10ms is ~45,000 wakeups/second, and that load *was* most
@@ -225,14 +225,15 @@ behind, no matter what the check says.
 Replacing it with event-driven handoff — register a future, wake exactly one
 waiter per released slot — cut the cost of a queued request from ~100
 wakeups/second to one. Side effects: p50 latency under the 500 rps spike fell
-from 836ms to **22.7ms**, p99 from 5091ms to 3067ms, and the queue became FIFO,
-which polling never was.
+from 836ms to **588ms** and p99 from 5091ms to 3334ms, checkouts reaching a
+processor went from 55.6% to **89.2%**, and the queue became FIFO, which polling
+never was.
 
-The residual 138ms is scheduling lag at the fallback boundary. A bounded 50ms
+The residual 270ms is scheduling lag at the fallback boundary. A bounded 50ms
 fallback remains on purpose and is not vestigial: release events cover the
 in-flight ceiling, but the *rate* ceiling frees capacity through the passage of
 time with nothing to emit an event, so a waiter must re-check eventually. The
-brief asks for "queued briefly (e.g. 2-3 seconds max)"; 2638ms is inside that.
+brief asks for "queued briefly (e.g. 2-3 seconds max)"; 2770ms is inside that.
 
 ---
 
@@ -426,6 +427,15 @@ PSPs, once on uvloop + httptools, absorbed **561 rps** in the same test.
 So a single-process generator cannot produce a 500 rps flash sale, and any
 "we hit 500 rps" claim from one would be false. The generator shards its target
 rate across `--workers` OS processes (default 6) and aggregates the results.
+
+**And past some concurrency, the generator measures itself.** With six workers
+plus three mock PSPs plus the router — ten CPU-hungry processes on eight cores —
+p95 latency read 670ms and Atlas sat pinned at 19/19 in-flight while using 67 of
+its 127 rps. I nearly re-sized the in-flight bound for a 280ms round trip that
+did not exist. Re-run with two workers: p95 **34ms**, peak in-flight 8 of 40,
+**zero** in-flight rejections. Worker count is now derived from `os.cpu_count()`,
+reserving the four service cores plus one, and `tests/test_config.py` asserts the
+throughput relationship so a re-sizing cannot quietly reintroduce a throttle.
 
 Two related environment findings:
 
