@@ -34,10 +34,11 @@ It installs missing dependencies itself. `make verify`, `make verify-quick` and
 | A specific scenario | `./run.sh` then `python3 -m loadgen.demo --only failure` | ~1 min |
 | Live system state | `./run.sh` then `curl localhost:8080/metrics/summary` | — |
 
-The 75 unit tests are the fastest way to see whether the two graded requirements
+The 90 unit tests are the fastest way to see whether the two graded requirements
 are implemented correctly: `tests/test_ratelimit.py` is Requirement 1,
-`tests/test_health.py` is Requirement 2, and both encode the specific bugs found
-during development so a future edit cannot silently reintroduce them.
+`tests/test_health.py` is Requirement 2, `tests/test_service.py` covers admission
+control, failover and capacity release — and all of them encode the specific bugs
+found during development so a future edit cannot silently reintroduce them.
 
 ### Running it by hand
 
@@ -120,7 +121,7 @@ That is a deliberate choice, discussed under Tradeoffs.
 | `loadgen/generate.py` | Multi-process traffic generator + rate-limit verification |
 | `loadgen/demo.py` | The four-scenario narrated demo |
 | `config/processors.json` | All tunables in one place |
-| `tests/` | 75 unit tests; each encodes a bug found during development |
+| `tests/` | 90 unit tests; each encodes a bug found during development |
 | `verify.sh` | One-command boot + test + demo + teardown, CI-safe exit code |
 
 ---
@@ -150,7 +151,7 @@ designs before the invariant made it structural.
 | Scenario | p50 | p95 | p99 |
 |---|---|---|---|
 | Normal, 120 rps | 21ms | 36ms | 67ms |
-| Midnight spike, 500 rps | 836ms | 5000ms | 5091ms |
+| Midnight spike, 500 rps | 23ms | 2537ms | 3067ms |
 | Processor failure mid-sale | 28ms | 144ms | 342ms |
 | After recovery | 194ms | 2633ms | 5021ms |
 
@@ -197,31 +198,41 @@ normal traffic saves 15.45% while the priority lane knowingly pays a premium —
 priority baskets are the high-value ones and route to the most reliable
 processor regardless of fee. Averaging the lanes hid both facts.
 
-### One target not met: the queue deadline is soft
-
-Stated plainly because the numbers are in the output and I would rather name it
-than have a reviewer find it:
+### The queue deadline, and how it was closed
 
 | Lane | Budget | Max observed | Over budget |
 |---|---|---|---|
-| normal | 2500ms | 3005ms | 86.6% of queued requests |
-| priority | 5000ms | 5497ms | 71.8% of queued requests |
+| normal | 2500ms | 2638ms | 26.5% of queued requests, by ≤138ms |
+| priority | 5000ms | 5044ms | 0.4% of queued requests, by ≤44ms |
 
-The overshoot is ~500ms, about 20% of budget, and it applies only to requests
-that queued at all (2,103 of 7,370 during the spike). It is **not** a logic
-error — the deadline is re-checked after every wake and the sleep is clamped to
-the remaining time. It is event-loop lag: a `sleep(10ms)` does not resume in
-10ms when the loop is saturated, so the wait lands late no matter what the
-comparison says.
+This started far worse and took three rounds to fix, which is worth recording
+because the first two rounds were the wrong fix.
 
-Two rounds of work took it from 816ms of overshoot to ~500ms (clamping the
-sleep, and cutting the queue from 450 to 150 so fewer coroutines poll). The
-remaining gap needs the polling loop replaced with event-driven handoff, which
-is a concurrency change I was not willing to make against a verified build. It
-is the first item under future work.
+| Attempt | Normal max | Over budget |
+|---|---|---|
+| per-attempt deadline (each retry got a fresh 2500ms) | 5194ms | — |
+| request-scoped deadline | 3316ms | 89.4% |
+| + clamped sleep, queue cut 450 → 150 | 3005ms | 86.6% |
+| **+ event-driven handoff (final)** | **2638ms** | **26.5%** |
 
-The brief asks for "queued briefly (e.g. 2-3 seconds max)". At 3005ms the normal
-lane is marginally outside that. Worth knowing rather than glossing.
+The cause was not the deadline arithmetic. It was the polling loop: 450 queued
+coroutines waking every 10ms is ~45,000 wakeups/second, and that load *was* most
+of the event-loop lag making those same requests miss their deadline. The queue
+was generating the latency it existed to absorb. Tightening the comparison could
+not fix it — a `sleep(10ms)` does not resume in 10ms when the loop is that far
+behind, no matter what the check says.
+
+Replacing it with event-driven handoff — register a future, wake exactly one
+waiter per released slot — cut the cost of a queued request from ~100
+wakeups/second to one. Side effects: p50 latency under the 500 rps spike fell
+from 836ms to **22.7ms**, p99 from 5091ms to 3067ms, and the queue became FIFO,
+which polling never was.
+
+The residual 138ms is scheduling lag at the fallback boundary. A bounded 50ms
+fallback remains on purpose and is not vestigial: release events cover the
+in-flight ceiling, but the *rate* ceiling frees capacity through the passage of
+time with nothing to emit an event, so a waiter must re-check eventually. The
+brief asks for "queued briefly (e.g. 2-3 seconds max)"; 2638ms is inside that.
 
 ---
 
@@ -438,22 +449,13 @@ distributed-counter drift. Scaling out needs shared state (Redis token buckets,
 or a capacity share per replica) — that is the first thing I would build next
 and it is a genuinely different design, not a config change.
 
-**Polling queue, and it does not scale.** Waiting requests poll every 10ms
-rather than waiting on a condition variable. I originally wrote that this "costs
-up to 10ms of latency". Measured, it cost **~800ms**: at a 450-deep queue, 450
-coroutines waking every 10ms is ~45,000 wakeups/second, and that load is itself
-most of the event-loop lag. The queue was generating the latency that broke its
-own deadline -- 89.4% of queued requests exceeded the 2500ms budget, up to 3316ms.
-
-Two changes rather than one. The deadline is now re-checked after waking and the
-sleep is clamped to the remaining time, so the logic cannot overshoot. And the
-queue was cut to 150 (about 0.4s of capacity), which caps the wakeup load and
-sheds earlier. Both were needed: the second is what actually removes the lag.
-
-The proper fix is event-driven handoff -- signal waiters when a processor
-releases capacity, so a waiting request costs one wakeup instead of one per
-10ms. That is the next change I would make, and it is the honest reason the
-queue is shallow rather than a design preference.
+**Event-driven handoff, with a fallback poll.** Queued requests wait on a future
+and are woken one per released capacity slot. The 50ms fallback stays because the
+rate ceiling frees capacity by the passage of time and emits no event. A woken
+waiter can lose its slot to a request arriving at that instant; it re-registers
+and its deadline still bounds it. Fully fair handoff would need the arriving
+request to check for waiters first, which trades a little throughput for
+strictness — not obviously the right call for checkout.
 
 **Health is per-processor, not per-BIN.** In LATAM the biggest lever on
 authorization rates is routing by card BIN and issuer to a local acquirer. That
@@ -472,24 +474,20 @@ network tokens, no soft-decline taxonomy worth the name.
 
 ## What I would do next, in order
 
-1. **Event-driven queue handoff**, replacing the polling loop. Signal waiters
-   when a processor releases capacity so a queued request costs one wakeup
-   instead of one every 10ms. This is the only measured target the service does
-   not meet (see "One target not met" above) and it is a known, bounded change.
-2. **Shared-state rate limiting** so the router can run more than one replica.
+1. **Shared-state rate limiting** so the router can run more than one replica.
    This is the only thing standing between this and production.
-3. **BIN-level routing.** Track auth rate per (processor × BIN range × country)
+2. **BIN-level routing.** Track auth rate per (processor × BIN range × country)
    and route on it. In Mexico this is worth more than everything else here
    combined.
-4. **Adaptive selection.** The selection rule is a fixed sort. A contextual
+3. **Adaptive selection.** The selection rule is a fixed sort. A contextual
    bandit over processors — Thompson sampling on approval as the reward —
    explores and exploits automatically and would beat static ordering, without
    putting a model on the hot path.
-5. **Retry budgets.** Failover is capped per request but not globally. During a
+4. **Retry budgets.** Failover is capped per request but not globally. During a
    wide incident, retries add load exactly when there is none to spare.
-6. **Reconciliation.** Idempotency keys are honoured, but a timeout leaves a
+5. **Reconciliation.** Idempotency keys are honoured, but a timeout leaves a
    genuinely unknown state that only a settlement-file reconciliation resolves.
-7. **Adaptive headroom and in-flight bound** driven by measured latency,
+6. **Adaptive headroom and in-flight bound** driven by measured latency,
    recovering the ~15% of advertised capacity the static invariant reserves.
 
 ---

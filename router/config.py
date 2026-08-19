@@ -36,7 +36,11 @@ class AdmissionConfig:
     priority_queue_timeout_ms: int = 5000
     max_queue_depth: int = 2000
     max_priority_queue_depth: int = 500
-    poll_interval_ms: int = 10
+    poll_interval_ms: int = 10  # retained for config compatibility; unused
+    # Backstop only. Release events cover the in-flight ceiling; the rate ceiling
+    # frees capacity through the passage of time with no event to emit, so a
+    # waiter re-checks at least this often.
+    capacity_wait_fallback_ms: int = 50
 
 
 @dataclass(frozen=True)

@@ -13,7 +13,8 @@
     "priority_queue_timeout_ms": 5000,
     "max_queue_depth": 150,
     "max_priority_queue_depth": 50,
-    "poll_interval_ms": 10
+    "poll_interval_ms": 10,
+    "capacity_wait_fallback_ms": 50
   },
   "upstream": {
     "connect_timeout_s": 1.0,

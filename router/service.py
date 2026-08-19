@@ -127,6 +127,7 @@ class LoadDistributionService:
                         )
                     finally:
                         processor.limiter.release()
+                        self.pool.notify_capacity_released()
                     processor.health.record(result.outcome, is_probe=True)
                     log.info(
                         "PROBE  %-14s outcome=%-16s status=%s latency=%.0fms",
@@ -262,7 +263,10 @@ class LoadDistributionService:
                 finally:
                     # The in-flight slot must come back on every path, including
                     # cancellation, or the processor silently bleeds capacity.
+                    # Releasing without notifying is just as bad: the slot is
+                    # free and a queued request sleeps to its deadline anyway.
                     processor.limiter.release()
+                    self.pool.notify_capacity_released()
                 processor.health.record(result.outcome)
                 self._flush_state_changes()
 
@@ -368,7 +372,7 @@ class LoadDistributionService:
         and it is what admission control sheds against. Fewer moving parts, and
         no risk of a worker pool and a queue disagreeing about who owns a request.
         """
-        poll_s = self.cfg.admission.poll_interval_ms / 1000.0
+        fallback_s = self.cfg.admission.capacity_wait_fallback_ms / 1000.0
         waited_start = time.perf_counter()
 
         processor = self.pool.select(exclude=tried, priority=priority)
@@ -383,18 +387,25 @@ class LoadDistributionService:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                # Never sleep past the deadline, and re-check it after waking:
-                # under saturation the loop can take far longer than poll_s to
-                # resume this coroutine, so the pre-sleep check alone lets the
-                # wait overshoot by however far behind the loop is.
-                await asyncio.sleep(min(poll_s, remaining))
-                if time.monotonic() >= deadline:
-                    break
+
+                # Register BEFORE re-checking. The reverse order loses a release
+                # that lands in between and the waiter sleeps for nothing.
+                waiter = self.pool.register_waiter(priority)
+
                 processor = self.pool.select(exclude=tried, priority=priority)
                 if processor is not None:
+                    self.pool.discard_waiter(waiter, priority)
                     return processor, (time.perf_counter() - waited_start) * 1000
                 if not self.pool.any_available(exclude=tried):
+                    self.pool.discard_waiter(waiter, priority)
                     return None, (time.perf_counter() - waited_start) * 1000
+
+                try:
+                    await asyncio.wait_for(waiter, timeout=min(remaining, fallback_s))
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    self.pool.discard_waiter(waiter, priority)
+                    if time.monotonic() >= deadline:
+                        break
             return None, (time.perf_counter() - waited_start) * 1000
         finally:
             self._queued[lane] -= 1
@@ -469,6 +480,8 @@ class LoadDistributionService:
                 "max_priority_queue_depth": self.cfg.admission.max_priority_queue_depth,
                 "queue_timeout_ms": self.cfg.admission.queue_timeout_ms,
                 "requests_that_queued": c.queued_count,
+                "capacity_wakeups_issued": self.pool.wakeups_issued,
+                "registered_waiters": self.pool.waiting_count(),
                 "avg_queue_wait_ms": (
                     round(c.queue_wait_ms_total / c.queued_count, 2) if c.queued_count else 0.0
                 ),

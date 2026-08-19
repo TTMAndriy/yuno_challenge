@@ -33,7 +33,9 @@ the most headroom, per Stretch Goal B.
 
 from __future__ import annotations
 
+import asyncio
 import time
+from collections import deque
 
 from .config import AppConfig, ProcessorConfig
 from .health import BreakerState, HealthTier, Outcome, ProcessorHealth
@@ -93,11 +95,40 @@ class Processor:
 
 
 class ProcessorPool:
+    """The pool, plus the handoff that wakes queued requests when capacity frees.
+
+    Waiting used to be a poll: every queued request re-checked `select()` every
+    10ms. Measured, that did not scale -- at a 450-deep queue it is ~45,000
+    wakeups/second, and that load was itself most of the event-loop lag that made
+    queued requests miss their own deadline (86.6% over a 2500ms budget, up to
+    3005ms). The queue was generating the latency it was supposed to absorb.
+
+    This is the event-driven replacement. A request that cannot get capacity
+    registers a future and sleeps; releasing a capacity slot wakes exactly one
+    waiter. Cost per queued request falls from ~100 wakeups/second to one.
+
+    Two details that matter:
+
+    * Register BEFORE re-checking `select()`. The reverse order loses wakeups: a
+      release landing between the check and the registration would notify nobody
+      and the waiter would sleep to its deadline for no reason.
+
+    * Wake one, not all. `notify_all` on a 450-deep queue is a thundering herd
+      where 449 waiters wake to discover the single freed slot is gone. One
+      released slot admits exactly one request, so waking one waiter is both
+      correct and cheap -- and it makes the queue FIFO, which polling never was.
+
+    A woken waiter can still lose its slot to a request arriving fresh at that
+    instant; it simply re-registers, and its deadline still bounds the wait.
+    """
+
     def __init__(self, app_cfg: AppConfig) -> None:
         self.cfg = app_cfg
         self.processors: list[Processor] = [Processor(p, app_cfg) for p in app_cfg.processors]
         self._by_id = {p.id: p for p in self.processors}
         self.baseline_fee_percent = app_cfg.baseline_processor().fee_percent
+        self._waiters: dict[bool, deque[asyncio.Future]] = {False: deque(), True: deque()}
+        self.wakeups_issued = 0
 
     def get(self, processor_id: str) -> Processor | None:
         return self._by_id.get(processor_id)
@@ -143,6 +174,44 @@ class ProcessorPool:
         return any(
             p.health.allows_traffic(now) for p in self.processors if p.id not in exclude
         )
+
+    # -- capacity handoff -------------------------------------------------
+
+    def register_waiter(self, priority: bool) -> asyncio.Future:
+        """Claim a place in the queue. Must be called BEFORE re-checking select()."""
+        fut = asyncio.get_running_loop().create_future()
+        self._waiters[priority].append(fut)
+        return fut
+
+    def discard_waiter(self, fut: asyncio.Future, priority: bool) -> None:
+        try:
+            self._waiters[priority].remove(fut)
+        except ValueError:
+            pass  # already woken and popped by notify_capacity_released
+
+    def notify_capacity_released(self, slots: int = 1) -> None:
+        """Wake up to `slots` waiters, priority lane first.
+
+        Called after a capacity slot is returned. Skips futures already cancelled
+        by their own deadline rather than wasting the wakeup on them.
+        """
+        for _ in range(slots):
+            fut = None
+            for priority in (True, False):          # priority lane drains first
+                queue = self._waiters[priority]
+                while queue and fut is None:
+                    candidate = queue.popleft()
+                    if not candidate.done():
+                        fut = candidate
+                if fut is not None:
+                    break
+            if fut is None:
+                return                              # nobody waiting
+            fut.set_result(None)
+            self.wakeups_issued += 1
+
+    def waiting_count(self) -> int:
+        return len(self._waiters[False]) + len(self._waiters[True])
 
     def probe_candidates(self, now: float | None = None) -> list[Processor]:
         now = time.monotonic() if now is None else now
