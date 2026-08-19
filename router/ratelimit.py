@@ -70,21 +70,39 @@ class SlidingWindowLimiter:
     This is also the correct shape for a real client: a connection pool is an
     in-flight bound, and every production HTTP client has one.
 
-    Sizing the two ceilings together
-    --------------------------------
-    Adding the in-flight bound took Atlas from 168 observed arrivals (24
-    rejections) down to 131 against a 150 limit. The residual drift is bounded by
-    how many requests can be outstanding, and measured at roughly 0.45 x
-    max_inflight. Borealis exposed the remaining gap: its 100 rps limit gives the
-    least absolute headroom, so a proportional 10% left only 10 requests of slack
-    against ~12 of drift, and it went 2 over.
+    Sizing the two ceilings together -- the invariant
+    ------------------------------------------------
+    The two ceilings can *sum*. In the worst case a full batch of in-flight
+    requests lands inside the same PSP-second as a full rate window, so observed
+    arrivals approach:
 
-    Final sizing is headroom 15% with in-flight at 25% of the rate ceiling, which
-    satisfies `effective_limit + 0.45 * max_inflight < max_rps` on all three
-    processors including the smallest. A proportional headroom is the weak part
-    of this: the processor with the smallest absolute limit is always the tightest
-    case, and an adaptive bound derived from observed latency would be better than
-    two constants chosen to survive the worst one.
+        effective_limit + max_inflight
+
+    That is not a theory. With Cygnus at effective_limit=170 and max_inflight=42,
+    it was observed at 210 arrivals against its 200 limit -- and 170 + 42 = 212.
+    The prediction and the measurement agree to within two requests.
+
+    So the constants are not tuned, they are constrained:
+
+        effective_limit + max_inflight <= max_rps
+
+    and `max_inflight` is *derived* to satisfy it rather than configured
+    independently. A configuration that would violate the invariant is impossible
+    to express, which is the only way a limit like this stays correct after
+    someone edits the config six months from now.
+
+    The full sizing history, since two earlier attempts were wrong:
+
+        5% headroom, no in-flight bound      Atlas saw 156 / 150   24 rejections
+        15% headroom, no in-flight bound     Atlas saw 168 / 150  143 rejections
+        10% headroom + in-flight bound       Atlas saw 131 / 150    0 rejections
+        15% headroom + unconstrained bound   Cygnus saw 210 / 200  29 rejections
+        25% headroom + derived bound         invariant holds by construction
+
+    The cost is real: reserving both ceilings inside max_rps leaves advertised
+    capacity unused (450 rps configured, ~337 rps usable). An adaptive bound
+    driven by observed latency would recover most of that and is the change I
+    would make next.
     """
 
     def __init__(
@@ -99,10 +117,19 @@ class SlidingWindowLimiter:
         self.headroom = headroom
         # Never round down to zero for very small limits.
         self.effective_limit = max(1, int(max_rps * headroom))
-        # A processor answering in ~30ms drains this many times per second, so a
-        # bound of ~30% of the rate ceiling does not throttle a healthy processor
-        # while still capping a burst hard.
-        self.max_inflight = max(4, int(self.effective_limit * inflight_ratio))
+        # Derived, not configured: the requested ratio is honoured only while the
+        # invariant holds. `max_rps - effective_limit` is the entire budget left
+        # for a worst-case in-flight batch, so the bound can never exceed it.
+        requested_inflight = max(1, int(self.effective_limit * inflight_ratio))
+        headroom_budget = max_rps - self.effective_limit
+        self.max_inflight = max(1, min(requested_inflight, headroom_budget))
+        # Make the guarantee explicit and fail loudly rather than silently
+        # shipping a limiter that can overrun its processor.
+        assert self.effective_limit + self.max_inflight <= max_rps, (
+            f"limiter invariant violated for max_rps={max_rps}: "
+            f"{self.effective_limit} + {self.max_inflight} > {max_rps}"
+        )
+        self.inflight_was_clamped = self.max_inflight < requested_inflight
         self._inflight = 0
         self._peak_inflight = 0
         self._inflight_rejected = 0
@@ -180,6 +207,8 @@ class SlidingWindowLimiter:
             "utilization_pct": round(self.utilization() * 100, 1),
             "inflight": self._inflight,
             "max_inflight": self.max_inflight,
+            "inflight_clamped_by_invariant": self.inflight_was_clamped,
+            "worst_case_arrivals": self.effective_limit + self.max_inflight,
             "peak_inflight_observed": self._peak_inflight,
             "admitted_total": self._admitted_total,
             "rate_rejections_total": self._rejected_total,

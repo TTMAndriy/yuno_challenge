@@ -36,6 +36,7 @@ class AuthorizationResponse(BaseModel):
     status: str  # approved | declined | failed
     request_id: str
     idempotency_key: str
+    priority: bool = False  # which admission lane served this request
     processor_id: str | None = None
     processor_name: str | None = None
     authorization_code: str | None = None

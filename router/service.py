@@ -85,7 +85,8 @@ class LoadDistributionService:
             self.cfg.total_capacity_rps,
             len(self.pool.processors),
             ", ".join(
-                f"{p.id}={p.limiter.effective_limit}/{p.cfg.max_rps}rps@{p.fee_percent}%"
+                f"{p.id}={p.limiter.effective_limit}rps+{p.limiter.max_inflight}"
+                f"inflight<={p.cfg.max_rps}@{p.fee_percent}%"
                 for p in self.pool.processors
             ),
         )
@@ -186,6 +187,7 @@ class LoadDistributionService:
                 status="failed",
                 request_id=request_id,
                 idempotency_key=idem_key,
+                priority=req.priority,
                 error="system_at_capacity",
                 message=(
                     f"All processors saturated and the {lane} queue is full "
@@ -223,6 +225,7 @@ class LoadDistributionService:
                             status="failed",
                             request_id=request_id,
                             idempotency_key=idem_key,
+                priority=req.priority,
                             error="no_healthy_processor",
                             message="Every configured processor is currently unavailable.",
                             queued_ms=round(queued_ms, 2),
@@ -236,6 +239,7 @@ class LoadDistributionService:
                         status="failed",
                         request_id=request_id,
                         idempotency_key=idem_key,
+                priority=req.priority,
                         error="system_at_capacity",
                         message=(
                             f"No processor capacity within {timeout_s * 1000:.0f}ms. "
@@ -296,6 +300,7 @@ class LoadDistributionService:
                         status="approved",
                         request_id=request_id,
                         idempotency_key=idem_key,
+                priority=req.priority,
                         processor_id=processor.id,
                         processor_name=processor.name,
                         authorization_code=result.body.get("authorization_code"),
@@ -315,6 +320,7 @@ class LoadDistributionService:
                         status="declined",
                         request_id=request_id,
                         idempotency_key=idem_key,
+                priority=req.priority,
                         processor_id=processor.id,
                         processor_name=processor.name,
                         decline_code=result.body.get("decline_code"),
@@ -341,6 +347,7 @@ class LoadDistributionService:
             status="failed",
             request_id=request_id,
             idempotency_key=idem_key,
+                priority=req.priority,
             error="all_processors_failed",
             message=(
                 f"Tried {len(attempts)} processor(s); none returned an authorisation."
@@ -372,8 +379,17 @@ class LoadDistributionService:
         # none has capacity. This is the window that admission control sheds on.
         self._queued[lane] += 1
         try:
-            while time.monotonic() < deadline:
-                await asyncio.sleep(poll_s)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # Never sleep past the deadline, and re-check it after waking:
+                # under saturation the loop can take far longer than poll_s to
+                # resume this coroutine, so the pre-sleep check alone lets the
+                # wait overshoot by however far behind the loop is.
+                await asyncio.sleep(min(poll_s, remaining))
+                if time.monotonic() >= deadline:
+                    break
                 processor = self.pool.select(exclude=tried, priority=priority)
                 if processor is not None:
                     return processor, (time.perf_counter() - waited_start) * 1000

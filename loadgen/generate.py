@@ -106,6 +106,8 @@ class Results:
     errors: Counter = field(default_factory=Counter)
     latencies: list[float] = field(default_factory=list)
     queued: list[float] = field(default_factory=list)
+    queued_normal: list[float] = field(default_factory=list)
+    queued_priority: list[float] = field(default_factory=list)
     failover_count: int = 0
     approved_volume_cents: int = 0
     fees_cents: int = 0
@@ -121,6 +123,12 @@ class Results:
         q = body.get("queued_ms") or 0
         if q > 0:
             self.queued.append(q)
+            # Tracked per lane: the two lanes have different configured
+            # deadlines (2500ms / 5000ms), so a single max is unfalsifiable.
+            if body.get("priority"):
+                self.queued_priority.append(q)
+            else:
+                self.queued_normal.append(q)
 
         if status == "approved":
             self.approved += 1
@@ -154,6 +162,8 @@ class Results:
             "errors": dict(self.errors),
             "latencies": self.latencies,
             "queued": self.queued,
+            "queued_normal": self.queued_normal,
+            "queued_priority": self.queued_priority,
             "failover_count": self.failover_count,
             "approved_volume_cents": self.approved_volume_cents,
             "fees_cents": self.fees_cents,
@@ -173,6 +183,8 @@ class Results:
             out.errors.update(part["errors"])
             out.latencies.extend(part["latencies"])
             out.queued.extend(part["queued"])
+            out.queued_normal.extend(part["queued_normal"])
+            out.queued_priority.extend(part["queued_priority"])
             out.failover_count += part["failover_count"]
             out.approved_volume_cents += part["approved_volume_cents"]
             out.fees_cents += part["fees_cents"]
@@ -326,6 +338,17 @@ def print_results(results: Results, title: str = "RESULTS") -> None:
             f"    queued              {len(results.queued)} requests waited, "
             f"avg {avg_q:.0f}ms, max {max(results.queued):.0f}ms"
         )
+        for lane, waits, budget in (
+            ("normal", results.queued_normal, 2500),
+            ("priority", results.queued_priority, 5000),
+        ):
+            if waits:
+                over = sum(1 for w in waits if w > budget)
+                print(
+                    f"      {lane:<9} n={len(waits):<6} max={max(waits):>6.0f}ms  "
+                    f"budget={budget}ms  over budget: {over} "
+                    f"({over / len(waits) * 100:.1f}%)"
+                )
     if results.by_processor:
         print("\n    traffic distribution")
         served = sum(results.by_processor.values())

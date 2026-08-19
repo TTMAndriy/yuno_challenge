@@ -11,8 +11,8 @@
   "admission": {
     "queue_timeout_ms": 2500,
     "priority_queue_timeout_ms": 5000,
-    "max_queue_depth": 450,
-    "max_priority_queue_depth": 150,
+    "max_queue_depth": 150,
+    "max_priority_queue_depth": 50,
     "poll_interval_ms": 10
   },
   "upstream": {
@@ -20,7 +20,7 @@
     "read_timeout_s": 2.0,
     "max_attempts": 2,
     "rate_limit_headroom": 0.85,
-    "inflight_ratio": 0.25
+    "inflight_ratio": 0.15
   },
   "processors": [
     {
